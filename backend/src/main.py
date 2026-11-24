@@ -15,6 +15,7 @@ from .operations_evidence import router as operations_evidence
 from src.config.settings import REDIS_URL
 from src.middlewares.auth import current_user, issue_token, require_roles
 from src.middlewares.request_guard import rate_limit
+from src.services.job_queue import CANCELLABLE_STATUSES, QUEUE, ensure_job_schema, recover_stale_jobs
 from src.utils.db import clean, execute, execute_returning, fetch_all, fetch_one, wait_for_db
 
 app = FastAPI(title='展柜环境异常值守台', version='1.0.0')
@@ -114,6 +115,12 @@ def get_event_or_404(event_id):
 @app.on_event('startup')
 def startup():
     wait_for_db()
+    # 幂等补齐任务生命周期字段（兼容只跑过 001 迁移的旧数据卷）
+    ensure_job_schema()
+    # 后台重启后把挂着的 queued/running 任务重新投递，仍用点分析时冻结的采样
+    recovered = recover_stale_jobs()
+    for job in recovered:
+        print(f"[backend] 已恢复挂起的算法任务 run_id={job['id']} case_id={job['case_id']}", flush=True)
     if os.getenv('SEED_DEMO', 'true').lower() == 'true':
         from scripts.seed_demo import main as seed_main
         seed_main()
@@ -233,23 +240,84 @@ def create_sample(payload: SamplePayload, user=Depends(require_roles('operator',
 @app.post('/analyze')
 def analyze(case_id: int, user=Depends(require_roles('operator', 'supervisor'))):
     get_case_or_404(case_id)
+    # 点分析的这一刻冻结采样集合：中断恢复或重试都只用这批采样，
+    # 之后新录入的采样不会混入正在跑的任务
+    samples = fetch_all(
+        "SELECT id, sampled_at FROM environment_samples WHERE case_id=%s AND state='accepted' ORDER BY sampled_at",
+        (case_id,),
+    )
+    snapshot = [
+        {'sample_id': row['id'], 'sampled_at': row['sampled_at'].isoformat()}
+        for row in samples
+    ]
     run_key = f'case-{case_id}-{uuid.uuid4().hex[:12]}'
     row = execute_returning(
-        '''INSERT INTO algorithm_runs (run_key, case_id, status, input_summary, parameters)
-           VALUES (%s,%s,'queued',%s::jsonb,%s::jsonb) RETURNING *''',
-        (run_key, case_id, json.dumps({'case_id': case_id}), json.dumps({'random_state': 1069, 'contamination': 0.22, 'scaler': 'RobustScaler'})),
+        '''INSERT INTO algorithm_runs (run_key, case_id, status, input_summary, parameters, input_sample_ids)
+           VALUES (%s,%s,'queued',%s::jsonb,%s::jsonb,%s::jsonb) RETURNING *''',
+        (run_key, case_id,
+         json.dumps({'case_id': case_id, 'sample_count': len(snapshot)}),
+         json.dumps({'random_state': 1069, 'contamination': 0.22, 'scaler': 'RobustScaler'}),
+         json.dumps(snapshot)),
     )
-    redis_client.rpush('museum_case_anomaly_jobs', json.dumps({'run_id': row['id'], 'case_id': case_id}))
-    audit(user, 'queue_analysis', 'algorithm_run', row['id'], {'case_id': case_id})
+    redis_client.rpush(QUEUE, json.dumps({'run_id': row['id'], 'case_id': case_id}))
+    audit(user, 'queue_analysis', 'algorithm_run', row['id'],
+          {'case_id': case_id, 'sample_count': len(snapshot)})
     return clean(row)
+
+
+@app.get('/runs')
+def runs(case_id: int | None = None, user=Depends(current_user)):
+    """展柜页面查询算法任务：排队/计算中/恢复完成/已撤销都在这里。"""
+    if case_id:
+        rows = fetch_all(
+            '''SELECT r.*, u.display_name AS cancelled_by_name
+               FROM algorithm_runs r
+               LEFT JOIN users u ON u.id=r.cancelled_by
+               WHERE r.case_id=%s ORDER BY r.created_at DESC LIMIT 50''',
+            (case_id,),
+        )
+    else:
+        rows = fetch_all(
+            '''SELECT r.*, u.display_name AS cancelled_by_name
+               FROM algorithm_runs r
+               LEFT JOIN users u ON u.id=r.cancelled_by
+               ORDER BY r.created_at DESC LIMIT 50'''
+        )
+    return clean(rows)
 
 
 @app.get('/runs/{run_id}')
 def run_detail(run_id: int, user=Depends(current_user)):
-    row = fetch_one('SELECT * FROM algorithm_runs WHERE id=%s', (run_id,))
+    row = fetch_one(
+        '''SELECT r.*, u.display_name AS cancelled_by_name
+           FROM algorithm_runs r LEFT JOIN users u ON u.id=r.cancelled_by
+           WHERE r.id=%s''',
+        (run_id,),
+    )
     if not row:
         raise HTTPException(404, '算法任务不存在')
     return clean(row)
+
+
+@app.post('/runs/{run_id}/cancel')
+def cancel_run(run_id: int, user=Depends(require_roles('operator', 'supervisor'))):
+    """值守撤销未完成任务。撤销后即使 worker 算出分数也不允许发布告警。"""
+    row = fetch_one('SELECT * FROM algorithm_runs WHERE id=%s', (run_id,))
+    if not row:
+        raise HTTPException(404, '算法任务不存在')
+    if row['status'] not in CANCELLABLE_STATUSES:
+        raise HTTPException(409, f'任务已处于 {row["status"]} 状态，不能撤销')
+    updated = execute_returning(
+        '''UPDATE algorithm_runs
+              SET status='cancelled', cancelled_by=%s, cancelled_at=NOW(), updated_at=NOW()
+            WHERE id=%s AND status IN ('queued','running') RETURNING *''',
+        (user['id'], run_id),
+    )
+    if not updated:
+        raise HTTPException(409, '任务刚刚结束，撤销未生效')
+    audit(user, 'cancel_analysis', 'algorithm_run', run_id,
+          {'case_id': row['case_id'], 'previous_status': row['status']})
+    return clean(updated)
 
 
 @app.get('/anomalies')

@@ -79,6 +79,14 @@ Compose 恰好包含 `frontend`、`backend`、`worker`、`db`、`redis` 五个�
 
 门开采样只改变业务分类为门开干扰。连续异常计数由时间序列中的连续离群样本计算，达到 3 个时升级。少于 6 条有效采样时算法任务失败并把错误写入 `algorithm_runs.error`，便于重试。
 
+## 算法任务生命周期
+
+- **采样快照**。点分析的一刻把当时已有的有效采样 id 冻结到 `algorithm_runs.input_sample_ids`，中断后自动恢复或重跑同一个任务时始终使用这批采样，分析之后新录入的采样不会混入。
+- **重启自动恢复**。backend 与 worker 启动时都会扫描 `queued/running` 的任务：Redis 消息丢失的 `queued` 任务重新投递，随旧 worker 消失的 `running` 任务回到 `queued` 并累加 `recovery_count`，不会一直挂着。已在队列里的消息不重复投递。
+- **值守撤销**。operator/supervisor 可调用 `POST /runs/{id}/cancel` 撤销未完成任务。撤销后即使 worker 已经算出分数，发布事务也会拦截，不写入任何异常事件（告警）；撤销人、撤销时间写入审计与任务记录。
+- **整批发布与重试幂等**。异常事件在整批算齐后与任务终态在同一事务提交；`anomaly_events(sample_id)` 唯一索引配合 `ON CONFLICT` upsert，重试只更新同一条事件，不重复发告警，也不覆盖已有的值守处置状态。
+- **页面可查**。展柜档案页展示该柜的分析任务列表，可区分排队中/计算中/计算完成/计算失败/已撤销，恢复过的任务带「中断恢复 ×N」标记，并提供撤销按钮。
+
 ## 枚举出现位置
 
 - `CASE_STATUSES`、`ANOMALY_STATUSES`、`ANOMALY_TYPES`、`DUTY_ACTION_TYPES`、`CHECK_RESULTS` 位于 `backend/src/constants/enums.py`，数据库约束位于 `backend/migrations/001_init.sql`，前端展示映射位于 `frontend/src/app.js`。
@@ -90,9 +98,11 @@ Compose 恰好包含 `frontend`、`backend`、`worker`、`db`、`redis` 五个�
 ```text
 backend/
   migrations/001_init.sql
+  migrations/002_job_lifecycle.sql
   scripts/seed_demo.py
   src/main.py
   src/services/algorithm.py
+  src/services/job_queue.py
   src/worker.py
 frontend/
   index.html

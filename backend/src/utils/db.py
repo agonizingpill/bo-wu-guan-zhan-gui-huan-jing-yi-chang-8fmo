@@ -37,6 +37,20 @@ def get_conn():
         conn.close()
 
 
+@contextmanager
+def transactional():
+    """显式事务：块内多条语句一起提交，异常整体回滚。"""
+    conn = psycopg2.connect(DATABASE_URL)
+    try:
+        yield conn
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
 def fetch_all(sql, params=()):
     with get_conn() as conn:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:

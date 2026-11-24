@@ -7,6 +7,7 @@ const state = {
   dashboard: {},
   selectedCase: null,
   selectedEvent: null,
+  caseRuns: [],
   notice: ''
 };
 
@@ -21,7 +22,7 @@ const api = async (path, options = {}) => {
 
 const esc = (value) => String(value ?? '').replace(/[&<>'"]/g, (char) => ({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[char]));
 const fmt = (value) => value ? new Date(value).toLocaleString('zh-CN', { hour12: false }) : '—';
-const label = (value) => ({active:'在岗', maintenance:'维护', retired:'停用', open:'待处置', triaged:'已接单', escalated:'已升级', resolved:'待关闭', closed:'已关闭', watch:'观察', high:'高', critical:'严重', door_interference:'门开干扰', environment_outlier:'环境离群', continuous_drift:'连续偏移'}[value] || value);
+const label = (value) => ({active:'在岗', maintenance:'维护', retired:'停用', open:'待处置', triaged:'已接单', escalated:'已升级', resolved:'待关闭', closed:'已关闭', watch:'观察', high:'高', critical:'严重', door_interference:'门开干扰', environment_outlier:'环境离群', continuous_drift:'连续偏移', queued:'排队中', running:'计算中', succeeded:'计算完成', failed:'计算失败', cancelled:'已撤销'}[value] || value);
 const notify = (message) => { state.notice = message; render(); setTimeout(() => { state.notice = ''; render(); }, 3600); };
 
 function render() {
@@ -76,6 +77,7 @@ async function loadData() {
     if (state.page === 'case' && !state.selectedCase && state.cases[0]) state.selectedCase = state.cases[0].id;
     if (state.page === 'anomalies' && !state.selectedEvent && state.anomalies[0]) state.selectedEvent = state.anomalies[0].id;
     renderContent();
+    if (state.page === 'case') await loadCaseDetail();
   } catch (error) { notify(error.message); }
 }
 
@@ -114,7 +116,33 @@ function inspectionsPage() {
   return `<div class="inspection-layout"><section class="panel inspection-intro"><p class="eyebrow">ARTIFACT CHECK / POST-INCIDENT</p><h2>巡检是异常闭环的最后一道门</h2><p>每一次环境异常都要留下文物状态证据。巡检通过后，主管才可以关闭异常。失败会把事件重新打开，并保留原因与操作者。</p><div class="inspection-mark">⊙</div></section><section class="panel inspection-table"><div class="panel-head"><div><p class="eyebrow">RECENT CHECKS</p><h2>最近巡检</h2></div><button class="text-button" data-page="anomalies">回到异常队列 →</button></div>${state.anomalies.map(e => `<div class="inspection-row"><span class="case-code">${esc(e.case_code)}</span><span><b>${esc(e.artifact_title)}</b><small>${label(e.anomaly_type)} · ${fmt(e.created_at)}</small></span><span class="result ${e.passed_checks ? 'pass' : 'pending'}">${e.passed_checks ? '已通过' : '待巡检'}</span><button class="text-button" data-event="${e.id}">打开 →</button></div>`).join('')}</section></div>`;
 }
 function casePage() { const current = state.cases.find(c => c.id === state.selectedCase) || state.cases[0]; return `<div class="case-layout"><section class="panel case-directory"><div class="panel-head"><div><p class="eyebrow">DISPLAY CASE REGISTER / 04</p><h2>展柜档案</h2></div><span class="filter-pill">${state.cases.length} 个在岗柜</span></div>${state.cases.map(c => `<button class="directory-item ${current?.id===c.id?'selected':''}" data-case="${c.id}"><span>${esc(c.code)}</span><b>${esc(c.artifact_title)}</b><small>${esc(c.zone)}</small></button>`).join('')}</section><section class="panel case-detail">${current ? caseDetail(current) : empty('没有展柜档案', '先创建一个在岗展柜。')}</section></div>`; }
-function caseDetail(c) { return `<div class="case-heading"><div><p class="eyebrow">${esc(c.gallery)} / ${esc(c.zone)}</p><h2>${esc(c.artifact_title)}</h2><span class="case-code">${esc(c.code)} · ${esc(c.artifact_code)}</span></div><span class="case-status">${label(c.status)}</span></div><div class="threshold-band"><div><small>温度窗口</small><b>${c.target_temp_min} — ${c.target_temp_max} °C</b></div><div><small>湿度窗口</small><b>${c.target_rh_min} — ${c.target_rh_max} %</b></div><div><small>门磁编号</small><b>${esc(c.door_sensor_id)}</b></div></div><div class="sample-table"><div class="table-title"><span>最近环境采样</span><small>${c.samples?.length || c.sample_count} 条记录</small></div>${(c.samples || []).slice(0,8).map(s => `<div class="sample-row"><span>${fmt(s.sampled_at)}</span><b>${s.temperature} °C</b><b>${s.humidity} %</b><b>${s.co2_ppm} ppm</b><span class="door-tag ${s.door_open?'open':''}">${s.door_open?'门开':'闭合'}</span></div>`).join('')}</div><button class="button primary" id="analyze-case" data-case-id="${c.id}">重新运行异常识别 ↗</button></div>`; }
+function caseDetail(c) { return `<div class="case-heading"><div><p class="eyebrow">${esc(c.gallery)} / ${esc(c.zone)}</p><h2>${esc(c.artifact_title)}</h2><span class="case-code">${esc(c.code)} · ${esc(c.artifact_code)}</span></div><span class="case-status">${label(c.status)}</span></div><div class="threshold-band"><div><small>温度窗口</small><b>${c.target_temp_min} — ${c.target_temp_max} °C</b></div><div><small>湿度窗口</small><b>${c.target_rh_min} — ${c.target_rh_max} %</b></div><div><small>门磁编号</small><b>${esc(c.door_sensor_id)}</b></div></div><div class="sample-table"><div class="table-title"><span>最近环境采样</span><small>${c.samples?.length || c.sample_count} 条记录</small></div>${(c.samples || []).slice(0,8).map(s => `<div class="sample-row"><span>${fmt(s.sampled_at)}</span><b>${s.temperature} °C</b><b>${s.humidity} %</b><b>${s.co2_ppm} ppm</b><span class="door-tag ${s.door_open?'open':''}">${s.door_open?'门开':'闭合'}</span></div>`).join('')}</div><button class="button primary" id="analyze-case" data-case-id="${c.id}">重新运行异常识别 ↗</button>${runsPanel(c.id)}</div>`; }
+
+function runsPanel(caseId) {
+  const runs = (state.caseRuns || []).filter(run => run.case_id === caseId).slice(0, 8);
+  if (!runs.length) return `<div class="runs-panel"><div class="table-title"><span>分析任务</span><small>暂无任务记录</small></div></div>`;
+  const canCancel = state.user && ['operator', 'supervisor'].includes(state.user.role);
+  const rows = runs.map(run => {
+    const busy = ['queued', 'running'].includes(run.status);
+    const recoverTag = run.recovery_count > 0 ? `<span class="run-recover">中断恢复 ×${run.recovery_count}</span>` : '';
+    const sampleCount = run.input_sample_ids?.length ?? run.input_summary?.sample_count ?? 0;
+    const resultLine = run.status === 'cancelled'
+      ? `<small>${fmt(run.cancelled_at)} 由 ${esc(run.cancelled_by_name || '值守')} 撤销，结果不发布</small>`
+      : run.status === 'failed'
+        ? `<small>${esc(run.error || '计算失败')}</small>`
+        : run.status === 'succeeded'
+          ? `<small>告警 ${run.metrics?.outlier_count ?? 0} 条 · 采样 ${sampleCount} 点${run.recovery_count > 0 ? ' · 已恢复完成' : ''}</small>`
+          : `<small>使用点分析时冻结的 ${sampleCount} 条采样</small>`;
+    const cancelBtn = busy && canCancel ? `<button class="button subtle run-cancel" data-run-id="${run.id}">撤销任务</button>` : '';
+    return `<div class="run-row">
+      <span class="run-badge run-${run.status}">${label(run.status)}</span>
+      <div class="run-main"><b>任务 #${run.id} ${recoverTag}</b>${resultLine}</div>
+      <small class="run-time">${fmt(run.created_at)}</small>
+      ${cancelBtn}
+    </div>`;
+  }).join('');
+  return `<div class="runs-panel"><div class="table-title"><span>分析任务</span><small>重启后自动恢复 · 撤销后不发告警</small></div>${rows}</div>`;
+}
 function empty(title, copy) { return `<div class="empty"><div>○</div><h3>${title}</h3><p>${copy}</p></div>`; }
 
 function bind() {
@@ -125,12 +153,32 @@ function bind() {
   bindPage();
 }
 function bindPage() {
-  document.querySelectorAll('[data-case]').forEach(button => button.addEventListener('click', async () => { state.selectedCase = Number(button.dataset.case); if (state.page === 'monitor') { state.page='case'; } render(); await loadData(); if (state.page === 'case') { const detail = await api(`/cases/${state.selectedCase}`); state.cases = state.cases.map(c => c.id===state.selectedCase ? {...c, ...detail} : c); renderContent(); } }));
+  document.querySelectorAll('[data-case]').forEach(button => button.addEventListener('click', async () => { state.selectedCase = Number(button.dataset.case); if (state.page === 'monitor') { state.page='case'; } render(); await loadData(); if (state.page === 'case') { await loadCaseDetail(); } }));
   document.querySelectorAll('[data-event]').forEach(button => button.addEventListener('click', async () => { state.selectedEvent = Number(button.dataset.event); state.page='anomalies'; render(); await loadData(); }));
-  document.querySelector('#analyze-case')?.addEventListener('click', async (event) => { try { const run = await api(`/analyze?case_id=${event.currentTarget.dataset.caseId}`, { method: 'POST' }); notify(`算法任务 #${run.id} 已入队，worker 正在处理`); pollRun(run.id); } catch (error) { notify(error.message); } });
+  document.querySelector('#analyze-case')?.addEventListener('click', async (event) => { try { const run = await api(`/analyze?case_id=${event.currentTarget.dataset.caseId}`, { method: 'POST' }); notify(`算法任务 #${run.id} 已入队，使用当前已有的 ${run.input_sample_ids.length} 条采样`); await loadCaseRuns(state.selectedCase); renderContent(); pollRun(run.id); } catch (error) { notify(error.message); } });
+  document.querySelectorAll('.run-cancel').forEach(button => button.addEventListener('click', async () => {
+    if (!window.confirm('撤销后该任务即使算出分数也不会发布告警，确认撤销？')) return;
+    try { await api(`/runs/${button.dataset.runId}/cancel`, { method: 'POST' }); notify('任务已撤销，不会再发布告警'); await loadCaseRuns(state.selectedCase); renderContent(); } catch (error) { notify(error.message); }
+  }));
   document.querySelectorAll('[data-action]').forEach(button => button.addEventListener('click', () => handleAction(button.dataset.action)));
 }
-async function pollRun(id) { for (let i=0;i<15;i++) { await new Promise(r => setTimeout(r, 1000)); const run = await api(`/runs/${id}`); if (run.status === 'succeeded') { notify(`异常识别完成，发现 ${run.metrics.outlier_count} 个候选事件`); await loadData(); return; } if (run.status === 'failed') { notify(run.error); return; } } }
+
+async function loadCaseDetail() {
+  if (!state.selectedCase) return;
+  const [detail, runs] = await Promise.all([
+    api(`/cases/${state.selectedCase}`),
+    api(`/runs?case_id=${state.selectedCase}`),
+  ]);
+  state.cases = state.cases.map(c => c.id === state.selectedCase ? { ...c, ...detail } : c);
+  state.caseRuns = runs;
+  renderContent();
+}
+
+async function loadCaseRuns(caseId) {
+  if (!caseId) return;
+  state.caseRuns = await api(`/runs?case_id=${caseId}`);
+}
+async function pollRun(id) { for (let i=0;i<15;i++) { await new Promise(r => setTimeout(r, 1000)); const run = await api(`/runs/${id}`); if (run.status === 'succeeded') { notify(run.recovery_count > 0 ? `中断恢复的任务 #${id} 已完成，发现 ${run.metrics.outlier_count} 个候选事件` : `异常识别完成，发现 ${run.metrics.outlier_count} 个候选事件`); await loadData(); await loadCaseRuns(state.selectedCase); return; } if (run.status === 'failed') { notify(run.error); await loadCaseRuns(state.selectedCase); return; } if (run.status === 'cancelled') { notify('任务已被撤销，未发布告警'); await loadCaseRuns(state.selectedCase); return; } } }
 async function handleAction(action) { const e = state.anomalies.find(item => item.id === state.selectedEvent); if (!e) return; try { if (action === 'close') { await api(`/anomalies/${e.id}/close`, { method: 'POST' }); notify('异常已关闭'); } else if (action === 'inspect') { await api(`/anomalies/${e.id}/artifact-checks`, { method: 'POST', body: JSON.stringify({case_id:e.case_id,event_id:e.id,check_type:'post_incident',result:'pass',notes:'夜班巡检确认展柜玻璃、底座与文物状态正常'}) }); notify('文物巡检已记录为通过'); } else { const map = { door:'verify_door_sealed', adjust:'adjust_climate', curator:'call_curator' }; await api(`/anomalies/${e.id}/duty-actions`, { method:'POST', body: JSON.stringify({action_type:map[action], notes: action==='door'?'门已关闭，复采前完成门磁复核':'已按值守清单完成处置记录', status:'completed'}) }); notify('值守动作已写入审计'); } await loadData(); } catch (error) { notify(error.message); } }
 
 render();
